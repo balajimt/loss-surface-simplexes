@@ -22,6 +22,44 @@ import time
 sys.path.append("../../simplex/models/")
 from vgg_noBN import VGG16, VGG16Simplex
 from simplex_models import SimplexNet, Simplex
+
+import scipy as scipy
+from scipy import stats
+import numpy as np
+
+import torchvision
+cifar10 = torchvision.datasets.CIFAR10('dataset', download = True)
+
+def get_ep_nd_loss_fn(nd):
+    """
+    Generate the loss function for a SINGLE ellipsoid.
+    The ellipsoid's matrix is chosen by randomly sampling a positive definite matrix 
+    (this is done by sampling it from a wishart distribution)
+    """
+    v = torch.tensor([0 for _ in range(nd * nd)])
+    S = torch.tensor(scipy.stats.wishart(df=nd+2, scale=0.05*np.diag(np.ones((nd,)))).rvs())
+    def ep_nd_loss_fn(X):
+        row = X.shape[0]
+        col = X.shape[1]
+        # print(row, col)
+        X = X.reshape([row * col, 1])
+        # print(X.shape)
+        if X.shape[0] < nd:
+            X = np.concatenate([X, v[X.shape[0]:]])
+        transpose = torch.transpose(X, 0, 1).float()
+        matrix1 = torch.matmul(transpose, S.float()).float()
+        matrix2 = torch.matmul(matrix1, X)
+        return matrix2[0][0]
+    return ep_nd_loss_fn
+
+class EllipsoidLoss(nn.Module):
+    def __init__(self, dimensions, weight=None, size_average=True):
+        self.loss_function = get_ep_nd_loss_fn(dimensions)
+        super(EllipsoidLoss, self).__init__()
+
+    def forward(self, inputs, targets, smooth=1): 
+        # print(inputs.shape)
+        return self.loss_function(inputs)
         
 def main(args):
     savedir = "./saved-outputs/"
@@ -35,13 +73,14 @@ def main(args):
         out_dim = 10
         simplex_model = SimplexNet(out_dim, VGG16Simplex, n_vert=start_vert,
                                fix_points=fix_pts)
-        simplex_model = simplex_model.cuda()
+        # simplex_model = simplex_model.cuda()
         
         log_vol = (simplex_model.total_volume() + 1e-4).log()
         
         reg_pars.append(max(float(args.LMBD)/log_vol, 1e-8))
     
-    
+    print(fix_pts)
+
     ## import training and testing data ##
     transform_train = transforms.Compose([
         transforms.RandomHorizontalFlip(),
@@ -71,9 +110,7 @@ def main(args):
     for component in range(args.n_component):
         ## load in pre-trained model ##
         fix_pts = [False]
-        simplex_model = SimplexNet(10, VGG16Simplex, n_vert=1,
-                               fix_points=fix_pts).cuda()
-
+        simplex_model = SimplexNet(10, VGG16Simplex, n_vert=1, fix_points=fix_pts)
 
         ## add a new points and train ##
         for vv in range(args.n_verts):
@@ -92,7 +129,7 @@ def main(args):
                     weight_decay=args.wd
                 )
 
-            criterion = torch.nn.CrossEntropyLoss()
+            criterion = EllipsoidLoss()
             n_epoch = args.base_epochs if vv==0 else args.simplex_epochs
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 
                                                                    T_max=n_epoch)
@@ -139,7 +176,6 @@ def main(args):
             torch.save(checkpoint, savedir + fname) 
 
             simplex_model.add_vert()
-            simplex_model = simplex_model.cuda()
 
 
     
