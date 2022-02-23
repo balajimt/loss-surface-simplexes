@@ -61,8 +61,9 @@ class EllipsoidLossFunction(nn.Module):
         transpose = torch.transpose(X, 0, 1).float()
         matrix1 = torch.matmul(transpose, self.ellipsoid_matrix.float()).float()
         matrix2 = torch.matmul(matrix1, X)
+        # print(matrix2[0][0])
 
-        if matrix2[0][0] < 1:
+        if matrix2[0][0] < 5:
             return matrix2[0][0], True
         else:
             return matrix2[0][0], False
@@ -72,16 +73,14 @@ class EllipsoidLayer(SimplexModule):
     def __init__(self, fix_points):
         super(EllipsoidLayer, self).__init__(fix_points, ('cartesian_vertices'))
         self.dimensions = 2
-        xs = torch.linspace(-10, 10, steps=100)
-        ys = torch.linspace(-10, 10, steps=100)
+        xs = torch.linspace(1, 10, steps=100)
+        ys = torch.linspace(1, 10, steps=100)
         self.cartesian_space = torch.cartesian_prod(xs, ys)
-        # print(self.cartesian_space.shape)
-        # print("Creating ellipsoid module")
+        print("Created cartesian space of size:", self.cartesian_space.shape)
         for i, fixed in enumerate(self.fix_points):
             self.register_parameter('cartesian_vertices_%d' % i, Parameter(self.cartesian_space, requires_grad=not fixed))
 
     def forward(self):
-        # print("Calls forward")
         x = 2
     
     def get_cartesian_space(self):
@@ -98,7 +97,6 @@ class EllipsoidModel(nn.Module):
         self.ellipseLayer = EllipsoidLayer(fix_points)
     
     def forward(self, x, coeffs_t):
-        # print("Model forward is called", x, coeffs_t)
         x = 2
     
     def get_cartesian_space(self):
@@ -114,14 +112,20 @@ def train_ellipsoid_volume(number_of_random_points, model, criterion, optimizer,
 
     # Gets a random point n number of times, and if it's not in the ellipse volume
     # Removes it from the cartesian space
+    truth_sum = 0
     for _ in range(number_of_random_points):
         acc_loss = 0.
         cartesian_space = model.get_cartesian_space()
         chosen_input = random.choice(cartesian_space)
-        truth_value, acc_loss = criterion.get_ellipsoid_loss(chosen_input)
+        # print(chosen_input)
+        acc_loss, truth_value = criterion.get_ellipsoid_loss(chosen_input)
 
         if truth_value == False:
-            cartesian_space.remove(chosen_input)
+            # print(cartesian_space.tolist()[0])
+            chosen_input = chosen_input.tolist()
+            cartesian_space_list = cartesian_space.tolist()
+            cartesian_space_list.remove(chosen_input)
+            cartesian_space = torch.tensor(cartesian_space_list)
         
         model.set_cartesian_space(cartesian_space)
         vol = model.total_volume()
@@ -133,10 +137,11 @@ def train_ellipsoid_volume(number_of_random_points, model, criterion, optimizer,
         optimizer.step()
 
         loss_sum += loss.item() * 1
+        truth_sum += int(truth_value)
 
     return {
         'loss': loss_sum/number_of_random_points,
-        'accuracy': int(truth_value)/number_of_random_points * 100.0,
+        'accuracy': int(truth_sum)/number_of_random_points,
     }
         
 def main(args):
@@ -154,12 +159,12 @@ def main(args):
         reg_pars.append(max(float(args.LMBD)/log_vol, 1e-8))
     
     ## load in pre-trained model ##
-    fix_pts = [True]
+    fix_pts = [False]
     n_vert = len(fix_pts)
     simplex_model = SimplexNet(out_dim, EllipsoidModel, n_vert=n_vert, fix_points=fix_pts)
 
     ## add a new points and train ##
-    for vv in range(1, args.n_verts+1):
+    for vv in range(0, args.n_verts+1):
         simplex_model.add_vert()
         optimizer = torch.optim.SGD(
             simplex_model.parameters(),
@@ -176,8 +181,7 @@ def main(args):
             lr = optimizer.param_groups[0]['lr']
             values = [vv, epoch + 1, lr, train_res['loss'], train_res['accuracy'], time_ep, simplex_model.total_volume().item()]
 
-            table = tabulate.tabulate([values], columns, 
-                                      tablefmt='simple', floatfmt='8.4f')
+            table = tabulate.tabulate([values], columns, tablefmt='simple', floatfmt='8.4f')
             if epoch % 40 == 0:
                 table = table.split('\n')
                 table = '\n'.join([table[1]] + table)
