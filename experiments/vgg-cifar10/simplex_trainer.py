@@ -4,10 +4,6 @@ from torch import nn
 import numpy as np
 import pandas as pd
 import argparse
-
-from torch.utils.data import DataLoader
-import torchvision
-from torchvision import transforms
 import glob
 
 import tabulate
@@ -17,99 +13,168 @@ import sys
 sys.path.append("../../simplex/")
 import utils
 from simplex_helpers import volume_loss
-import surfaces
 import time
 sys.path.append("../../simplex/models/")
 from vgg_noBN import VGG16, VGG16Simplex
 from simplex_models import SimplexNet, Simplex
+from simplex_models import SimplexModule
+
+import scipy as scipy
+from scipy import stats
+import numpy as np
+from re import L
+import numpy as np
+import math
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.nn import Module, Parameter
+from torch.nn.modules.utils import _pair
+from scipy.special import binom
+import sys
+sys.path.append("..")
+import utils
+from simplex_helpers import complex_volume
+
+class EllipsoidLossFunction(nn.Module):
+    def __init__(self, dimensions):
+        self.dimensions = dimensions
+        # Create zero vector
+        self.zero_vector = torch.zeros(dimensions)
+        # Sample a ellipsoid matrix -> In this case the matrix corresponds to region with low loss
+        self.ellipsoid_matrix = torch.tensor(scipy.stats.wishart(df=dimensions+2, scale=0.05*np.diag(np.ones((dimensions,)))).rvs())
+    
+    # Function returns True if it's within the ellipsoid else False
+    def get_ellipsoid_loss(self, X):
+        # X is the sampled point (chosen at random from the entire space)
+        # For example in the case of 2D space, X should be of the form ((x,y))
+
+        # Sanity to reshape X to pre-defined format
+        # print(X.shape)
+        X = X.reshape([X.shape[0], 1])
+
+        # Add zero padding so that X matches dimensions
+        if X.shape[0] < self.dimensions:
+            X = torch.cat((X, self.zero_vector[X.shape[0]:]), 0)
+
+        # Multiply with ellipsoid matrix to generate a loss value for the given point
+        transpose = torch.transpose(X, 0, 1).float()
+        matrix1 = torch.matmul(transpose, self.ellipsoid_matrix.float()).float()
+        matrix2 = torch.matmul(matrix1, X)
+
+        if matrix2[0][0] < 1:
+            return matrix2[0][0], True
+        else:
+            return matrix2[0][0], False
+
+# Creates a layer with all cartesian variables (vertices)
+class EllipsoidLayer(SimplexModule):
+    def __init__(self, fix_points):
+        super(EllipsoidLayer, self).__init__(fix_points, ('cartesian_vertices'))
+        self.dimensions = 2
+        xs = torch.linspace(-10, 10, steps=100)
+        ys = torch.linspace(-10, 10, steps=100)
+        self.cartesian_space = torch.cartesian_prod(xs, ys)
+        # print(self.cartesian_space.shape)
+        # print("Creating ellipsoid module")
+        for i, fixed in enumerate(self.fix_points):
+            self.register_parameter('cartesian_vertices_%d' % i, Parameter(self.cartesian_space, requires_grad=not fixed))
+
+    def forward(self):
+        # print("Calls forward")
+        x = 2
+    
+    def get_cartesian_space(self):
+        return self.cartesian_space
+    
+    def set_cartesian_space(self, cartesian_space):
+        self.cartesian_space = cartesian_space
+
+    
+class EllipsoidModel(nn.Module):
+    def __init__(self, n_output, fix_points=[False]):
+        # print("Model init is called")
+        super(EllipsoidModel, self).__init__()
+        self.ellipseLayer = EllipsoidLayer(fix_points)
+    
+    def forward(self, x, coeffs_t):
+        # print("Model forward is called", x, coeffs_t)
+        x = 2
+    
+    def get_cartesian_space(self):
+        return self.ellipseLayer.get_cartesian_space()
+    
+    def set_cartesian_space(self, cartesian_space):
+        return self.ellipseLayer.set_cartesian_space(cartesian_space)
+
+import random
+def train_ellipsoid_volume(number_of_random_points, model, criterion, optimizer, vol_reg):
+    loss_sum = 0.0
+    model.train()
+
+    # Gets a random point n number of times, and if it's not in the ellipse volume
+    # Removes it from the cartesian space
+    for _ in range(number_of_random_points):
+        acc_loss = 0.
+        cartesian_space = model.get_cartesian_space()
+        chosen_input = random.choice(cartesian_space)
+        truth_value, acc_loss = criterion.get_ellipsoid_loss(chosen_input)
+
+        if truth_value == False:
+            cartesian_space.remove(chosen_input)
+        
+        model.set_cartesian_space(cartesian_space)
+        vol = model.total_volume()
+        log_vol = (vol + 1e-4).log()
+        loss = torch.tensor(int(truth_value)) - vol_reg * log_vol
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        loss_sum += loss.item() * 1
+
+    return {
+        'loss': loss_sum/number_of_random_points,
+        'accuracy': int(truth_value)/number_of_random_points * 100.0,
+    }
         
 def main(args):
-    savedir = "./saved-outputs/model_" + str(args.base_idx) + "/"
+    savedir = "saved-outputs/model_" + str(args.base_idx) + "/"
+    from pathlib import Path
+    Path(savedir).mkdir(parents=True, exist_ok=True)
     
     reg_pars = []
+    out_dim = 1
     for ii in range(0, args.n_verts+2):
         fix_pts = [True]*(ii + 1)
         start_vert = len(fix_pts)
-
-        out_dim = 10
-        simplex_model = SimplexNet(out_dim, VGG16Simplex, n_vert=start_vert,
-                               fix_points=fix_pts)
-        simplex_model = simplex_model.cuda()
-        
+        simplex_model = SimplexNet(out_dim, EllipsoidModel, n_vert=start_vert, fix_points=fix_pts)
         log_vol = (simplex_model.total_volume() + 1e-4).log()
-        
         reg_pars.append(max(float(args.LMBD)/log_vol, 1e-8))
-    
-    transform_train = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(32, padding=4),
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    ])
-
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    ])
-    dataset = torchvision.datasets.CIFAR10(args.data_path, 
-                                           train=True, download=False,
-                                           transform=transform_train)
-    trainloader = DataLoader(dataset, shuffle=True, batch_size=args.batch_size)
-    
-    testset = torchvision.datasets.CIFAR10(args.data_path, 
-                                           train=False, download=False,
-                                           transform=transform_test)
-    testloader = DataLoader(testset, shuffle=True, batch_size=args.batch_size)
     
     ## load in pre-trained model ##
     fix_pts = [True]
     n_vert = len(fix_pts)
-    simplex_model = SimplexNet(10, VGG16Simplex, n_vert=n_vert,
-                           fix_points=fix_pts).cuda()
-
-    base_model = VGG16().cuda()
-    fname = "./saved-outputs/model_" + str(args.base_idx) + "/base_model.pt"
-    base_model.load_state_dict(torch.load(fname))
-    simplex_model.import_base_parameters(base_model, 0)
+    simplex_model = SimplexNet(out_dim, EllipsoidModel, n_vert=n_vert, fix_points=fix_pts)
 
     ## add a new points and train ##
     for vv in range(1, args.n_verts+1):
         simplex_model.add_vert()
-        simplex_model = simplex_model.cuda()
         optimizer = torch.optim.SGD(
             simplex_model.parameters(),
             lr=args.lr_init,
             momentum=0.9,
             weight_decay=args.wd
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 
-                                                               T_max=args.epochs)
-        criterion = torch.nn.CrossEntropyLoss()
-        columns = ['vert', 'ep', 'lr', 'tr_loss', 
-                   'tr_acc', 'te_loss', 'te_acc', 'time', "vol"]
+        criterion = EllipsoidLossFunction(2)
+        columns = ['vert', 'ep', 'lr', 'tr_loss', 'tr_acc', 'time', "vol"]
         for epoch in range(args.epochs):
             time_ep = time.time()
-            train_res = utils.train_epoch_volume(trainloader, simplex_model, 
-                                                 criterion, optimizer, 
-                                                 reg_pars[vv], args.n_sample)
-
-            start_ep = (epoch == 0)
-            eval_ep = epoch % args.eval_freq == args.eval_freq - 1
-            end_ep = epoch == args.epochs - 1
-            if start_ep or eval_ep or end_ep:
-                test_res = utils.eval(testloader, simplex_model, criterion)
-            else:
-                test_res = {'loss': None, 'accuracy': None}
-
+            train_res = train_ellipsoid_volume(10, simplex_model, criterion, optimizer, reg_pars[vv])
             time_ep = time.time() - time_ep
-
             lr = optimizer.param_groups[0]['lr']
-            scheduler.step()
-
-            values = [vv, epoch + 1, lr, 
-                      train_res['loss'], train_res['accuracy'], 
-                      test_res['loss'], test_res['accuracy'], time_ep,
-                     simplex_model.total_volume().item()]
+            values = [vv, epoch + 1, lr, train_res['loss'], train_res['accuracy'], time_ep, simplex_model.total_volume().item()]
 
             table = tabulate.tabulate([values], columns, 
                                       tablefmt='simple', floatfmt='8.4f')
@@ -122,9 +187,7 @@ def main(args):
 
         checkpoint = simplex_model.state_dict()
         fname = "simplex_vertex" + str(vv) + ".pt"
-        torch.save(checkpoint, savedir + fname) 
-
-
+        torch.save(checkpoint, savedir + fname)
     
     
 if __name__ == '__main__':
@@ -164,7 +227,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--epochs",
         type=int,
-        default=10,
+        default=100,
         metavar="verts",
         help="number of vertices in simplex",
     )
