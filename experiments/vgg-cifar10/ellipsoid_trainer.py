@@ -44,9 +44,8 @@ class EllipsoidLossFunction(nn.Module):
         # Sample a ellipsoid matrix -> In this case the matrix corresponds to region with low loss
         self.ellipsoid_matrix = torch.tensor(scipy.stats.wishart(df=dimensions+2, scale=0.05*np.diag(np.ones((dimensions,)))).rvs())
     
-    # Function returns True if it's within the ellipsoid else False
     def get_ellipsoid_loss(self, X):
-        # X is the sampled point (chosen at random from the entire space)
+        # X is the sampled point
         # For example in the case of 2D space, X should be of the form ((x,y))
 
         # Sanity to reshape X to pre-defined format
@@ -61,89 +60,76 @@ class EllipsoidLossFunction(nn.Module):
         transpose = torch.transpose(X, 0, 1).float()
         matrix1 = torch.matmul(transpose, self.ellipsoid_matrix.float()).float()
         matrix2 = torch.matmul(matrix1, X)
-        # print(matrix2[0][0])
 
-        if matrix2[0][0] < 5:
-            return matrix2[0][0], True
+        # value < 1 , return -value
+        # value > 1 , return value
+        if matrix2[0][0] < 1:
+            return -matrix2[0][0]
         else:
-            return matrix2[0][0], False
+            return matrix2[0][0]
 
-# Creates a layer with all cartesian variables (vertices)
+# Creates an ellipsoid loss region
+ellipsoid_loss_function = EllipsoidLossFunction(2)
+
 class EllipsoidLayer(SimplexModule):
     def __init__(self, fix_points):
-        super(EllipsoidLayer, self).__init__(fix_points, ('cartesian_vertices'))
+        super(EllipsoidLayer, self).__init__(fix_points, ('weight', 'bias'))
         self.dimensions = 2
-        xs = torch.linspace(1, 10, steps=100)
-        ys = torch.linspace(1, 10, steps=100)
-        self.cartesian_space = torch.cartesian_prod(xs, ys)
-        print("Created cartesian space of size:", self.cartesian_space.shape)
+        # Random point
+        # TODO: Can make this a random point from uniform distribution
+        self.loss_point = torch.tensor([1.0] * self.dimensions)
+        # TODO: Register a single parameter instead of cartesian vertices
         for i, fixed in enumerate(self.fix_points):
-            self.register_parameter('cartesian_vertices_%d' % i, Parameter(self.cartesian_space, requires_grad=not fixed))
+            self.register_parameter(
+                'weight_%d' % i,
+                Parameter(self.loss_point, requires_grad=not fixed)
+            )
+        for i, fixed in enumerate(self.fix_points):
+            self.register_parameter('bias_%d' % i, None)
 
-    def forward(self):
-        x = 2
+    def forward(self, input, coeffs_t):
+        # Ignore input
+        global ellipsoid_loss_function
+        print(coeffs_t)
+        weight_t, bias_t = self.compute_weights_t(coeffs_t)
+        value = ellipsoid_loss_function.get_ellipsoid_loss(weight_t)
+        return value
     
-    def get_cartesian_space(self):
-        return self.cartesian_space
+    # Getter and Setters for loss point
+    def get_loss_point(self):
+        return self.loss_point
     
-    def set_cartesian_space(self, cartesian_space):
-        self.cartesian_space = cartesian_space
+    def set_loss_point(self, loss_point):
+        self.loss_point = loss_point
 
-    
+# Optimiser: MSE
+# Create dummy dataset when target = 1
 class EllipsoidModel(nn.Module):
     def __init__(self, n_output, fix_points=[False]):
-        # print("Model init is called")
         super(EllipsoidModel, self).__init__()
         self.ellipseLayer = EllipsoidLayer(fix_points)
     
     def forward(self, x, coeffs_t):
-        x = 2
-    
-    def get_cartesian_space(self):
-        return self.ellipseLayer.get_cartesian_space()
-    
-    def set_cartesian_space(self, cartesian_space):
-        return self.ellipseLayer.set_cartesian_space(cartesian_space)
+        value = self.ellipseLayer(x, coeffs_t)
+        return value
 
-import random
-def train_ellipsoid_volume(number_of_random_points, model, criterion, optimizer, vol_reg):
-    loss_sum = 0.0
-    model.train()
 
-    # Gets a random point n number of times, and if it's not in the ellipse volume
-    # Removes it from the cartesian space
-    truth_sum = 0
-    for _ in range(number_of_random_points):
-        acc_loss = 0.
-        cartesian_space = model.get_cartesian_space()
-        chosen_input = random.choice(cartesian_space)
-        # print(chosen_input)
-        acc_loss, truth_value = criterion.get_ellipsoid_loss(chosen_input)
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 
-        if truth_value == False:
-            # print(cartesian_space.tolist()[0])
-            chosen_input = chosen_input.tolist()
-            cartesian_space_list = cartesian_space.tolist()
-            cartesian_space_list.remove(chosen_input)
-            cartesian_space = torch.tensor(cartesian_space_list)
+import collections
+class EllipsoidDataset(Dataset):
+    def __init__(self, n):
+        self.dataset = collections.defaultdict(int)
+        for i in range(n):
+            self.dataset[i] = torch.tensor(1.0)
         
-        model.set_cartesian_space(cartesian_space)
-        vol = model.total_volume()
-        log_vol = (vol + 1e-4).log()
-        loss = torch.tensor(int(truth_value)) - vol_reg * log_vol
+    def __getitem__(self, index):
+        return (torch.tensor(float(index)), self.dataset[index])
+    
+    def __len__(self):
+        return len(self.dataset)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        loss_sum += loss.item() * 1
-        truth_sum += int(truth_value)
-
-    return {
-        'loss': loss_sum/number_of_random_points,
-        'accuracy': int(truth_sum)/number_of_random_points,
-    }
-        
 def main(args):
     savedir = "saved-outputs/model_" + str(args.base_idx) + "/"
     from pathlib import Path
@@ -172,11 +158,16 @@ def main(args):
             momentum=0.9,
             weight_decay=args.wd
         )
-        criterion = EllipsoidLossFunction(2)
-        columns = ['vert', 'ep', 'lr', 'tr_loss', 'tr_acc', 'time', "vol"]
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        criterion = torch.nn.CrossEntropyLoss()
+        columns = ['vert', 'ep', 'lr', 'tr_loss', 'tr_acc', 'te_loss', 'te_acc', 'time', "vol"]
+        dataset = EllipsoidDataset(1000)
+
+        trainloader = DataLoader(dataset, shuffle=True, batch_size=args.batch_size)
+
         for epoch in range(args.epochs):
             time_ep = time.time()
-            train_res = train_ellipsoid_volume(10, simplex_model, criterion, optimizer, reg_pars[vv])
+            train_res = utils.train_epoch_volume(trainloader, simplex_model, criterion, optimizer, reg_pars[vv], args.n_sample)
             time_ep = time.time() - time_ep
             lr = optimizer.param_groups[0]['lr']
             values = [vv, epoch + 1, lr, train_res['loss'], train_res['accuracy'], time_ep, simplex_model.total_volume().item()]
