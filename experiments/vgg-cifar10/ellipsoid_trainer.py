@@ -64,7 +64,7 @@ class EllipsoidLossFunction(nn.Module):
         # value < 1 , return -value
         # value > 1 , return value
         if matrix2[0][0] < 1:
-            return -matrix2[0][0]
+            return matrix2[0][0]
         else:
             return matrix2[0][0]
 
@@ -90,7 +90,7 @@ class EllipsoidLayer(SimplexModule):
     def forward(self, input, coeffs_t):
         # Ignore input
         global ellipsoid_loss_function
-        print(coeffs_t)
+        # print(coeffs_t)
         weight_t, bias_t = self.compute_weights_t(coeffs_t)
         value = ellipsoid_loss_function.get_ellipsoid_loss(weight_t)
         return value
@@ -112,6 +112,41 @@ class EllipsoidModel(nn.Module):
     def forward(self, x, coeffs_t):
         value = self.ellipseLayer(x, coeffs_t)
         return value
+
+def train_epoch_volume(loader, model, criterion, optimizer, vol_reg, nsample):
+
+    loss_sum = 0.0
+    correct = 0.0
+
+    model.train()
+
+    for i, (input, target) in enumerate(loader):
+        input_var = torch.autograd.Variable(input)
+        target_var = torch.autograd.Variable(target)
+        
+        acc_loss = 0.
+        for _ in range(nsample):
+                output = model(input_var)
+                acc_loss = acc_loss + criterion(output, target_var)
+        acc_loss.div(nsample)
+        
+        vol = model.total_volume()
+        log_vol = (vol + 1e-4).log()
+        
+        loss = acc_loss - vol_reg * log_vol
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        loss_sum += loss.item() * input.size(0)
+        if output > 0:
+            correct+=1
+
+    return {
+        'loss': loss_sum / len(loader.dataset),
+        'accuracy': correct / len(loader.dataset) * 100.0,
+    }
 
 
 from torch.utils.data import Dataset
@@ -159,15 +194,15 @@ def main(args):
             weight_decay=args.wd
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-        criterion = torch.nn.CrossEntropyLoss()
-        columns = ['vert', 'ep', 'lr', 'tr_loss', 'tr_acc', 'te_loss', 'te_acc', 'time', "vol"]
+        criterion = torch.nn.MSELoss()
+        columns = ['vert', 'ep', 'lr', 'tr_loss', 'tr_acc', 'time', "vol"]
         dataset = EllipsoidDataset(1000)
 
         trainloader = DataLoader(dataset, shuffle=True, batch_size=args.batch_size)
 
         for epoch in range(args.epochs):
             time_ep = time.time()
-            train_res = utils.train_epoch_volume(trainloader, simplex_model, criterion, optimizer, reg_pars[vv], args.n_sample)
+            train_res = train_epoch_volume(trainloader, simplex_model, criterion, optimizer, reg_pars[vv], args.n_sample)
             time_ep = time.time() - time_ep
             lr = optimizer.param_groups[0]['lr']
             values = [vv, epoch + 1, lr, train_res['loss'], train_res['accuracy'], time_ep, simplex_model.total_volume().item()]
